@@ -5,12 +5,35 @@ use unicode_normalization::UnicodeNormalization;
 use serde_json::Value;
 use std::path::Path;
 
+use std::sync::Arc;
+
 use bpe::byte_pair_encoding::BytePairEncoding;
 
 mod pretokenization;
 mod pretokenization_indices;
 use std::cell::RefCell;
 use std::borrow::Cow;
+
+/// Helper to extract regex pattern from tokenizer.json pre_tokenizer structure
+fn extract_regex_from_json(json: &Value) -> Option<String> {
+    if let Some(obj) = json.as_object() {
+        if let Some(regex) = obj.get("Regex").and_then(|v| v.as_str()) {
+            return Some(regex.to_string());
+        }
+        for (_, value) in obj {
+            if let Some(regex) = extract_regex_from_json(value) {
+                return Some(regex);
+            }
+        }
+    } else if let Some(arr) = json.as_array() {
+        for value in arr {
+            if let Some(regex) = extract_regex_from_json(value) {
+                return Some(regex);
+            }
+        }
+    }
+    None
+}
 
 /// Macro to standardize pretokenization function calls
 macro_rules! pretokenize {
@@ -162,6 +185,7 @@ fn encode_text_parallel(
     normalizer_type: &Option<String>,
     special_tokens: &HashMap<String, u32>,
     reverse_token_id_vec: &Vec<u32>,
+    custom_regex: &Option<fancy_regex::Regex>,
 ) -> Result<Vec<u32>, String> {
     // Check if text is empty
     if text.is_empty() {
@@ -209,7 +233,7 @@ fn encode_text_parallel(
             if start > last_end {
                 let part = &normalized[last_end..start];
                 if !part.is_empty() {
-                    let tokens = encode_regular_parallel(part, bpe, reverse_token_id_vec)?;
+                    let tokens = encode_regular_parallel(part, bpe, reverse_token_id_vec, custom_regex)?;
                     result.extend(tokens);
                 }
             }
@@ -222,14 +246,14 @@ fn encode_text_parallel(
         if last_end < normalized.len() {
             let part = &normalized[last_end..];
             if !part.is_empty() {
-                let tokens = encode_regular_parallel(part, bpe, reverse_token_id_vec)?;
+                let tokens = encode_regular_parallel(part, bpe, reverse_token_id_vec, custom_regex)?;
                 result.extend(tokens);
             }
         }
 
         result
     } else {
-        encode_regular_parallel(&normalized, bpe, reverse_token_id_vec)?
+        encode_regular_parallel(&normalized, bpe, reverse_token_id_vec, custom_regex)?
     };
 
     Ok(result)
@@ -240,32 +264,45 @@ fn encode_regular_parallel(
     text: &str,
     bpe: &BytePairEncoding,
     reverse_token_id_vec: &Vec<u32>,
+    custom_regex: &Option<fancy_regex::Regex>,
 ) -> Result<Vec<u32>, String> {
     // Create a fresh buffer for this thread
     let mut all_tokens = Vec::with_capacity(128);
 
-    // Use the indices-based pretokenization for better performance
-    let end_indices = pretokenize!(text);
+    let mut all_dedup_tokens = Vec::new();
 
-    let mut start = 0;
-    for &end in &end_indices {
-        let piece = &text[start..end];
-        start = end;
-
-        if piece.is_empty() {
-            continue;
+    if let Some(regex) = custom_regex {
+        // Slower path using generic fancy regex
+        for mat in regex.find_iter(text) {
+            if let Ok(m) = mat {
+                let piece = m.as_str();
+                if !piece.is_empty() {
+                    let dedup_tokens = bpe.encode_via_backtracking(piece.as_bytes());
+                    all_dedup_tokens.extend(dedup_tokens);
+                }
+            }
         }
+    } else {
+        // Fast path for Qwen
+        let end_indices = pretokenize!(text);
 
-        // BPE tokenization
-        let dedup_tokens = bpe.encode_via_backtracking(piece.as_bytes());
+        let mut start = 0;
+        for &end in &end_indices {
+            let piece = &text[start..end];
+            start = end;
 
-        // Map from deduplicated indices to original token IDs
-        for dedup_id in dedup_tokens {
-            let original_id = *reverse_token_id_vec
-                .get(dedup_id as usize)
-                .ok_or_else(|| format!("Invalid dedup ID: {}", dedup_id))?;
-            all_tokens.push(original_id);
+            if !piece.is_empty() {
+                let dedup_tokens = bpe.encode_via_backtracking(piece.as_bytes());
+                all_dedup_tokens.extend(dedup_tokens);
+            }
         }
+    }
+
+    for dedup_id in all_dedup_tokens {
+        let original_id = *reverse_token_id_vec
+            .get(dedup_id as usize)
+            .ok_or_else(|| format!("Invalid dedup ID: {}", dedup_id))?;
+        all_tokens.push(original_id);
     }
     
     Ok(all_tokens)
@@ -281,6 +318,7 @@ struct QwenTokenizer {
     token_id_map: HashMap<u32, u32>,  // Maps original token IDs to deduplicated indices
     reverse_token_id_vec: Vec<u32>,  // Maps deduplicated indices back to original IDs (Vec for O(1) lookup)
     vector_pool: VectorPool,  // Pool for reusing Vec<u32> allocations
+    custom_regex: Option<fancy_regex::Regex>,
 }
 
 #[pymethods]
@@ -467,7 +505,25 @@ impl QwenTokenizer {
             // }
         }
 
-        // Pre-tokenization will use the globally precompiled regex
+        // Pre-tokenization will use the globally precompiled regex or a custom one if specified
+        let mut custom_regex: Option<fancy_regex::Regex> = None;
+        let tokenizer_json_path = dir.join("tokenizer.json");
+        if tokenizer_json_path.exists() {
+            if let Ok(content) = std::fs::read_to_string(&tokenizer_json_path) {
+                if let Ok(json) = serde_json::from_str::<Value>(&content) {
+                    if let Some(pre_tok) = json.get("pre_tokenizer") {
+                        if let Some(regex_str) = extract_regex_from_json(pre_tok) {
+                            // Check if it's not the Qwen fast regex
+                            if regex_str != crate::pretokenization::QWEN_PATTERN_FAST &&
+                               regex_str != crate::pretokenization::QWEN_PATTERN_WITH_LOOKAHEAD &&
+                               regex_str != crate::pretokenization::QWEN_PATTERN_WITHOUT_LOOKAHEAD {
+                                custom_regex = fancy_regex::Regex::new(&regex_str).ok();
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         Ok(QwenTokenizer {
             bpe,
@@ -486,6 +542,7 @@ impl QwenTokenizer {
                 vec
             },
             vector_pool: VectorPool::new(),
+            custom_regex,
         })
     }
 
@@ -569,27 +626,37 @@ impl QwenTokenizer {
 
     /// Internal method to encode regular text using indices-based pretokenization
     fn encode_regular(&self, text: &str) -> PyResult<Vec<u32>> {
-        // Apply pre-tokenization using indices for better performance
         let mut all_tokens = self.vector_pool.get_buffer(128);  // Get from pool
-
-        // Use the indices-based pretokenization for better performance
-        let end_indices = pretokenize!(text);
-
-        // Pass 1: Collect all dedup tokens from BPE encoding
         let mut all_dedup_tokens = Vec::new();
-        let mut start = 0;
-        for &end in &end_indices {
-            let piece = &text[start..end];
-            start = end;
 
-            if piece.is_empty() {
-                continue;
+        if let Some(regex) = &self.custom_regex {
+            // Generic pretokenization for non-Qwen architectures
+            for mat in regex.find_iter(text) {
+                if let Ok(m) = mat {
+                    let piece = m.as_str();
+                    if piece.is_empty() {
+                        continue;
+                    }
+                    let piece_bytes = piece.as_bytes();
+                    let dedup_tokens = self.bpe.encode_via_backtracking(piece_bytes);
+                    all_dedup_tokens.extend(dedup_tokens);
+                }
             }
-            // Convert to bytes for BPE encoding
-            let piece_bytes = piece.as_bytes();
-            // Use the fast BPE encoding from rust-gems
-            let dedup_tokens = self.bpe.encode_via_backtracking(piece_bytes);
-            all_dedup_tokens.extend(dedup_tokens);
+        } else {
+            // Use the fast indices-based pretokenization for Qwen
+            let end_indices = pretokenize!(text);
+            let mut start = 0;
+            for &end in &end_indices {
+                let piece = &text[start..end];
+                start = end;
+
+                if piece.is_empty() {
+                    continue;
+                }
+                let piece_bytes = piece.as_bytes();
+                let dedup_tokens = self.bpe.encode_via_backtracking(piece_bytes);
+                all_dedup_tokens.extend(dedup_tokens);
+            }
         }
 
         // Pass 2: Batch convert dedup tokens to original IDs
@@ -683,6 +750,7 @@ impl QwenTokenizer {
         let normalizer_type = Arc::new(&self.normalizer_type);
         let special_tokens = Arc::new(&self.special_tokens);
         let reverse_token_id_vec = Arc::new(&self.reverse_token_id_vec);
+        let custom_regex = Arc::new(&self.custom_regex);
         
         // Use a scoped thread pool if num_workers is specified, otherwise use global pool
         if let Some(workers) = num_workers {
@@ -701,6 +769,7 @@ impl QwenTokenizer {
                             &**normalizer_type,
                             &**special_tokens,
                             &**reverse_token_id_vec,
+                            &**custom_regex,
                         )
                     })
                     .collect::<Result<Vec<_>, _>>()
@@ -718,6 +787,7 @@ impl QwenTokenizer {
                         &**normalizer_type,
                         &**special_tokens,
                         &**reverse_token_id_vec,
+                        &**custom_regex,
                     )
                 })
                 .collect::<Result<Vec<_>, _>>()
@@ -792,16 +862,28 @@ impl QwenTokenizer {
 
         // Use the fast count method from BPE with indices-based pretokenization
         let mut count = 0;
-        let end_indices = pretokenize!(&normalized);
+        
+        if let Some(regex) = &self.custom_regex {
+            for mat in regex.find_iter(&normalized) {
+                if let Ok(m) = mat {
+                    let piece_bytes = m.as_str().as_bytes();
+                    if !piece_bytes.is_empty() {
+                        count += self.bpe.count(piece_bytes);
+                    }
+                }
+            }
+        } else {
+            let end_indices = pretokenize!(&normalized);
 
-        let mut start = 0;
-        for &end in &end_indices {
-            let piece = &normalized[start..end];
-            start = end;
+            let mut start = 0;
+            for &end in &end_indices {
+                let piece = &normalized[start..end];
+                start = end;
 
-            if !piece.is_empty() {
-                let piece_bytes = piece.as_bytes();
-                count += self.bpe.count(piece_bytes);
+                if !piece.is_empty() {
+                    let piece_bytes = piece.as_bytes();
+                    count += self.bpe.count(piece_bytes);
+                }
             }
         }
         
