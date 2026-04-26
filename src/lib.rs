@@ -5,8 +5,6 @@ use unicode_normalization::UnicodeNormalization;
 use serde_json::Value;
 use std::path::Path;
 
-use std::sync::Arc;
-
 use bpe::byte_pair_encoding::BytePairEncoding;
 
 mod pretokenization;

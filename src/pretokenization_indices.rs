@@ -1,6 +1,5 @@
 use crate::pretokenization::GLOBAL_QWEN_FAST_REGEX;
 use unicode_general_category::{get_general_category, GeneralCategory};
-use std::time::Instant;
 
 /// Macro to conditionally enable timing logs for pretokenization
 /// Use with --features timing-logs to enable
@@ -42,10 +41,6 @@ macro_rules! time_total {
 fn is_hspace_no_crlf(c: char) -> bool {
     c.is_whitespace() && c != '\r' && c != '\n'
 }
-
-/// Punctuation for our purposes: not whitespace and not alphanumeric
-#[inline]
-fn is_punct(c: char) -> bool { !c.is_whitespace() && !is_letter(c) && !c.is_numeric() }
 
 #[inline(always)]
 fn is_letter(c: char) -> bool {
@@ -1011,7 +1006,6 @@ fn split_mixed_whitespace_indices(text: &str, end_indices: &[usize]) -> Vec<usiz
         let mut has_crlf = false;
         let mut first_kind: i8 = -1; // 0=space,1=tab,2=VT,3=FF
         let mut mixed_ascii = false;
-        let mut last_byte: u8 = 0;
         for &b in bytes {
             if b < 0x80 {
                 // classify ASCII
@@ -1023,7 +1017,6 @@ fn split_mixed_whitespace_indices(text: &str, end_indices: &[usize]) -> Vec<usiz
                     // not whitespace
                     is_ws_no_nl_ascii = false;
                 }
-                last_byte = b;
             } else { ascii_only = false; break; }
         }
 
